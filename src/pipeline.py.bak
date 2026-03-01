@@ -55,13 +55,9 @@ import sys
 import getpass
 import time
 import math
-import warnings
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-
-# Suppress Google GenAI SDK warnings about non-text parts (thought_signature)
-warnings.filterwarnings("ignore", message=".*non-text parts.*")
 
 import pandas as pd
 import numpy as np
@@ -88,27 +84,6 @@ try:
 except ImportError:
     genai = None
     gtypes = None
-
-
-# ══════════════════════════════════════════════════════════════
-# RATE LIMITER (for Google / Vertex AI)
-# ══════════════════════════════════════════════════════════════
-class RateLimiter:
-    """Token-bucket style rate limiter for RPM-constrained APIs."""
-
-    def __init__(self, rpm: int):
-        self.rpm = rpm
-        self.interval = 60.0 / rpm
-        self._lock = asyncio.Lock()
-        self._last = 0.0
-
-    async def acquire(self):
-        async with self._lock:
-            now = asyncio.get_event_loop().time()
-            wait = self._last + self.interval - now
-            if wait > 0:
-                await asyncio.sleep(wait)
-            self._last = asyncio.get_event_loop().time()
 
 
 # ══════════════════════════════════════════════════════════════
@@ -750,11 +725,9 @@ async def call_anthropic(
 
 async def call_google(
     client: Any, system_prompt: str, vignette: str, model: str,
-    sem: asyncio.Semaphore, temperature: float,
-    rate_limiter: Optional[RateLimiter] = None,
+    sem: asyncio.Semaphore, temperature: float
 ) -> Tuple[Optional[Dict], Dict]:
-    """Call Google Gemini via the unified google-genai SDK (AI Studio or Vertex AI)."""
-    GOOGLE_MAX_RETRIES = 8  # More retries for Google/Vertex
+    """Call Google Gemini via the unified google-genai SDK."""
     meta = {
         "raw_text": None,
         "response_id": None,
@@ -765,9 +738,7 @@ async def call_google(
     user_prompt = build_user_prompt(vignette)
 
     async with sem:
-        for attempt in range(1, GOOGLE_MAX_RETRIES + 1):
-            if rate_limiter:
-                await rate_limiter.acquire()
+        for attempt in range(1, MAX_RETRIES + 1):
             try:
                 config_kwargs = {
                     "system_instruction": system_prompt,
@@ -832,8 +803,8 @@ async def call_google(
             except Exception as e:
                 err_str = repr(e)
                 meta["last_error"] = err_str
-                if attempt < GOOGLE_MAX_RETRIES:
-                    delay = RETRY_BASE_DELAY * (2 ** min(attempt - 1, 5))
+                if attempt < MAX_RETRIES:
+                    delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
                     if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
                         # Parse "Please retry in XXs" from the error
                         retry_match = re.search(r"retry in (\d+(?:\.\d+)?)s", err_str, re.IGNORECASE)
@@ -1196,7 +1167,6 @@ async def run_single_call(
     caller,
     temperature: float,
     checkpoint_path: Optional[Path] = None,
-    rate_limiter: Optional[RateLimiter] = None,
 ) -> Dict:
     """Run a single API call and return the result."""
     provider = task["provider"]
@@ -1204,10 +1174,7 @@ async def run_single_call(
     system_prompt = task["system_prompt"]
     vignette = task["vignette"]
 
-    if provider in ("google", "vertex"):
-        parsed, meta = await caller(client, system_prompt, vignette, model, sem, temperature, rate_limiter=rate_limiter)
-    else:
-        parsed, meta = await caller(client, system_prompt, vignette, model, sem, temperature)
+    parsed, meta = await caller(client, system_prompt, vignette, model, sem, temperature)
     case = task["case"]
     grades = grade_output(parsed, case)
 
@@ -1254,7 +1221,6 @@ async def run_pipeline_async(
     n_cases: int,
     max_concurrent: int,
     temperature: float,
-    rate_limiter: Optional[RateLimiter] = None,
 ):
     """Async pipeline runner."""
 
@@ -1280,7 +1246,7 @@ async def run_pipeline_async(
             caller = call_openai_responses
     elif provider == "anthropic":
         caller = call_anthropic
-    elif provider in ("google", "vertex"):
+    elif provider == "google":
         caller = call_google
     else:
         raise ValueError(f"Unknown provider: {provider}")
@@ -1376,7 +1342,7 @@ async def run_pipeline_async(
     sem = asyncio.Semaphore(max_concurrent)
     results = await asyncio.gather(
         *[
-            run_single_call(task, client, sem, progress, caller, temperature, checkpoint_path, rate_limiter=rate_limiter)
+            run_single_call(task, client, sem, progress, caller, temperature, checkpoint_path)
             for task in tasks
         ]
     )
@@ -1422,20 +1388,19 @@ async def main():
     print(f"    Iterations: {len(iters_df)} injections")
 
     # ── Provider selection ──
-    print("\n  Available providers: openai, anthropic, google, vertex")
+    print("\n  Available providers: openai, anthropic, google")
     provider = input("  Provider [openai]: ").strip().lower() or "openai"
-    if provider not in ("openai", "anthropic", "google", "vertex"):
+    if provider not in ("openai", "anthropic", "google"):
         print(f"  Unknown provider: {provider}")
         return
 
     # ── Model selection ──
-    preset_key = "google" if provider == "vertex" else provider
-    presets = MODEL_PRESETS.get(preset_key, [])
+    presets = MODEL_PRESETS.get(provider, [])
     if not presets:
-        print(f"  No presets for {preset_key}")
+        print(f"  No presets for {provider}")
         return
 
-    print(f"\n  Available models for {preset_key} (via {provider}):")
+    print(f"\n  Available models for {provider}:")
     for i, p in enumerate(presets, 1):
         print(f"    {i}) {p['model']:30s}  {p['name']}")
 
@@ -1484,20 +1449,13 @@ async def main():
     temperature = float(temperature_input) if temperature_input else 0.3
 
     # Smart default concurrency
-    if provider == "vertex":
-        default_conc = 30  # Vertex AI has high limits
-    elif provider == "google":
-        default_conc = 15  # AI Studio has lower limits
-    else:
-        default_conc = 30
+    default_conc = 30 if provider != "google" else 15
     conc_input = input(f"  Max concurrency [{default_conc}]: ").strip()
     max_concurrent = int(conc_input) if conc_input.isdigit() else default_conc
     max_concurrent = max(1, max_concurrent)
 
     # ── Initialize client ──
     print("\n  Initializing API client...")
-    rate_limiter = None
-
     if provider == "openai":
         if AsyncOpenAI is None:
             raise ImportError("pip install -U 'openai>=2.0.0'")
@@ -1513,29 +1471,6 @@ async def main():
             raise ImportError("pip install -U 'google-genai>=1.0.0'")
         api_key = ask_key("GOOGLE_API_KEY", "Google Genai API key")
         client = genai.Client(api_key=api_key)
-        # Rate limiter for AI Studio (preview models have lower limits)
-        is_preview = "preview" in model.lower()
-        rpm = 30 if is_preview else 800
-        rate_limiter = RateLimiter(rpm)
-        print(f"  Rate limiter: {rpm} RPM (AI Studio, preview={is_preview})")
-    elif provider == "vertex":
-        if genai is None:
-            raise ImportError("pip install -U 'google-genai>=1.0.0'")
-        project = os.environ.get("GOOGLE_CLOUD_PROJECT", "").strip()
-        if not project:
-            project = input("  Google Cloud Project ID: ").strip()
-        if not project:
-            raise ValueError("Google Cloud Project ID is required for Vertex AI.")
-        if "gemini-3" in model.lower():
-            location = "global"
-            print(f"  Note: Gemini 3 preview models require location='global'")
-        else:
-            location = os.environ.get("GOOGLE_CLOUD_LOCATION", "").strip()
-            if not location:
-                location = input("  Location [us-central1]: ").strip() or "us-central1"
-        client = genai.Client(vertexai=True, project=project, location=location)
-        print(f"  Vertex AI: project={project}, location={location}")
-        # Vertex AI has very high rate limits; no rate limiter needed by default
     else:
         raise ValueError(f"Unknown provider: {provider}")
 
@@ -1554,16 +1489,11 @@ async def main():
             caller = call_openai_responses
     elif provider == "anthropic":
         caller = call_anthropic
-    elif provider in ("google", "vertex"):
-        caller = call_google
     else:
-        raise ValueError(f"Unknown provider: {provider}")
+        caller = call_google
 
     sem = asyncio.Semaphore(1)
-    if provider in ("google", "vertex"):
-        parsed, meta = await caller(client, test_system_prompt, test_vignette, model, sem, temperature, rate_limiter=rate_limiter)
-    else:
-        parsed, meta = await caller(client, test_system_prompt, test_vignette, model, sem, temperature)
+    parsed, meta = await caller(client, test_system_prompt, test_vignette, model, sem, temperature)
     if meta.get("api_error"):
         print(f"  ERROR: {meta['api_error']}")
         return
@@ -1584,7 +1514,6 @@ async def main():
         n_cases=n_cases,
         max_concurrent=max_concurrent,
         temperature=temperature,
-        rate_limiter=rate_limiter,
     )
 
     if not results:
